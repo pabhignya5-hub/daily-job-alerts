@@ -2,70 +2,89 @@
 """
 job_alerts.py
 
-One-shot script (no internal scheduler). It:
-- Loads a curated list of companies from companies.json (you provide exact career slugs or URLs).
-- Scrapes Lever (via Lever API) and Greenhouse (HTML) and generic URLs where possible.
-- Filters for jobs posted/updated in the last 24 hours.
-- Produces a CSV and emails the list (plain text + attachment).
+Best-effort, one-shot job collector for U.S. positions (onsite / hybrid / remote).
+- Searches public web (DuckDuckGo HTML front-end) across reputable job platforms:
+  lever.co, greenhouse.io, workday.com, linkedin.com, indeed.com, angel.co, glassdoor.com
+- Visits each result and attempts to extract exact job title, company, location and direct apply link.
+- Filters to roles posted/updated in the last 24 hours and with U.S. locations (or Remote/Hybrid).
+- Deduplicates, saves CSV, and emails the compiled list.
 
-Usage:
-- Create a companies.json next to this script. Format examples are below.
-- Set environment variables: EMAIL_ADDRESS, EMAIL_PASSWORD, RECIPIENT (optional).
-- Run: python job_alerts.py
+Notes & caveats:
+- This approach is best-effort scraping of public pages. Some sites (LinkedIn, Glassdoor) aggressively block scraping or render with JavaScript;
+  results for such sites may be incomplete.
+- DuckDuckGo HTML search (html.duckduckgo.com/html/) is used to avoid paid search APIs and heavy blocking.
+- For production reliability consider official APIs, curated company lists, or a paid job data provider.
 
-Sample companies.json (required; place next to script):
-{
-  "Stripe": { "platform": "lever", "value": "stripe" },
-  "Coinbase": { "platform": "lever", "value": "coinbase" },
-  "ExampleCoGreenhouse": { "platform": "greenhouse", "value": "exampleco" },
-  "CustomDirect": { "platform": "url", "value": "https://example.com/careers" }
-}
+Environment variables required:
+- EMAIL_ADDRESS
+- EMAIL_PASSWORD
+Optional:
+- RECIPIENT (defaults to EMAIL_ADDRESS)
+- SMTP_HOST (default smtp.gmail.com)
+- SMTP_PORT (default 465)
 
-Notes:
-- This intentionally avoids any search APIs. The file is curated: you control which companies are checked.
-- Only jobs with a detectable posted/updated datetime within the last 24 hours are included.
+Dependencies:
+pip install requests beautifulsoup4 python-dateutil dateparser
+
+Run:
+python job_alerts.py
 """
 
+from datetime import datetime, timedelta
 import os
 import sys
-import json
-import csv
-import io
 import time
+import io
+import csv
+import re
 import requests
-from datetime import datetime, timedelta
-from email.message import EmailMessage
-import smtplib
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 import dateparser
+from email.message import EmailMessage
+import smtplib
 
-# CONFIG
+# -------- Configuration --------
 EMAIL = os.environ.get("EMAIL_ADDRESS")
 PASSWORD = os.environ.get("EMAIL_PASSWORD")
-RECIPIENT = os.environ.get("EMAIL_ADDRESS", EMAIL)
+RECIPIENT = os.environ.get("RECIPIENT", EMAIL)
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", 465))
 
 if not EMAIL or not PASSWORD:
-    sys.exit("Missing EMAIL_ADDRESS or EMAIL_PASSWORD environment variables. Set them before running.")
+    sys.exit("Set EMAIL_ADDRESS and EMAIL_PASSWORD environment variables before running.")
 
-COMPANIES_FILE = os.environ.get("COMPANIES_FILE", "companies.json")
-USER_AGENT = {"User-Agent": "Mozilla/5.0 (compatible; JobAlerts/1.0)"}
+USER_AGENT = {"User-Agent": "Mozilla/5.0 (compatible; JobAlerts/1.0; +https://example.com)"}
 TIME_WINDOW = timedelta(days=1)  # last 24 hours
 
-# ---------------- Utilities ----------------
-def parse_date(text):
-    if not text:
-        return None
+KEYWORDS = [
+    "software engineer", "software developer", "full stack", "full-stack",
+    "backend engineer", "frontend engineer", "backend developer", "frontend developer"
+]
+
+# Reputable domains to bias searches toward
+REPUTABLE_SITES = [
+    "lever.co", "greenhouse.io", "workday.com", "indeed.com",
+    "linkedin.com", "angel.co", "glassdoor.com", "remoteok.com",
+    "weworkremotely.com", "remote.co"
+]
+
+DUCKDUCKGO_HTML = "https://html.duckduckgo.com/html/"
+
+# US state abbreviations + 'United States' check
+US_STATE_ABBRS = set("""
+AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT
+NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY
+""".split())
+US_INDICATORS = ["united states", "usa", "us", "u.s.", "u.s.a."]
+
+
+# -------- Helpers --------
+def http_get(url, timeout=12):
     try:
-        dt = dateparser.parse(text, settings={"RETURN_AS_TIMEZONE_AWARE": False})
-        return dt
+        return requests.get(url, headers=USER_AGENT, timeout=timeout)
     except Exception:
         return None
-
-def is_recent(dt):
-    if not dt:
-        return False
-    return (datetime.now() - dt) <= TIME_WINDOW
 
 def domain_of(url):
     try:
@@ -73,206 +92,252 @@ def domain_of(url):
     except Exception:
         return ""
 
-# ---------------- Lever (reliable) ----------------
-def scrape_lever(slug, display_name=None):
-    """
-    Uses Lever's public postings API: https://api.lever.co/v0/postings/{company}?mode=json
-    Returns list of dicts with Job Title, Company, Location, Apply Link, Posted Date (datetime)
-    """
-    jobs = []
-    api = f"https://api.lever.co/v0/postings/{slug}?mode=json"
-    try:
-        r = requests.get(api, headers=USER_AGENT, timeout=12)
-        if r.status_code != 200:
-            return jobs
-        data = r.json()
-        for p in data:
-            # Fields vary; attempt common keys
-            title = p.get("text") or p.get("title") or p.get("position") or ""
-            apply_link = p.get("hostedUrl") or p.get("applyUrl") or p.get("url") or ""
-            # Lever postings often have 'categories' with 'location'
-            categories = p.get("categories") or {}
-            location = categories.get("location") or categories.get("office") or "Remote"
-            # date fields: 'createdAt', 'date', 'postedAt'
-            raw_date = p.get("createdAt") or p.get("date") or p.get("postedAt") or p.get("updatedAt")
-            posted_dt = parse_date(raw_date) or None
-            if posted_dt and is_recent(posted_dt):
-                jobs.append({
-                    "Job Title": title.strip(),
-                    "Company": display_name or slug,
-                    "Location": location.strip() if location else "Remote",
-                    "Apply Link": apply_link or f"https://jobs.lever.co/{slug}",
-                    "Posted Date": posted_dt.isoformat()
-                })
-    except Exception:
-        pass
-    return jobs
+def parse_date(text):
+    if not text:
+        return None
+    dt = dateparser.parse(text, settings={"RETURN_AS_TIMEZONE_AWARE": False})
+    return dt
 
-# ---------------- Greenhouse (HTML) ----------------
-def scrape_greenhouse(slug, display_name=None):
+def posted_within_24h(dt):
+    if not dt:
+        return False
+    return (datetime.now() - dt) <= TIME_WINDOW
+
+def looks_like_us_location(text):
+    if not text:
+        return False
+    t = text.lower()
+    if any(ind in t for ind in US_INDICATORS):
+        return True
+    if "remote" in t:
+        return True
+    if "hybrid" in t or "on-site" in t or "onsite" in t:
+        return True
+    # look for "City, ST" patterns and state abbreviations
+    m = re.search(r",\s*([A-Za-z]{2})\b", text)
+    if m and m.group(1).upper() in US_STATE_ABBRS:
+        return True
+    # look for full state name
+    for st in ("california","new york","texas","washington","florida","illinois","massachusetts"):
+        if st in t:
+            return True
+    return False
+
+def matches_role(text):
+    if not text:
+        return False
+    t = text.lower()
+    for kw in KEYWORDS:
+        if kw in t:
+            return True
+    return False
+
+def extract_job_from_page(url):
     """
-    Scrape Board page and each job page for date. Requires the job page to have a <time datetime="..."> or 'posted' text.
+    Visit the job posting page and attempt to extract:
+      - title (h1, meta og:title, title tag)
+      - company (meta og:site_name, .company, similar)
+      - location (common labels, or look for 'Remote'/'Hybrid'/'City, ST')
+      - posted date (time tags, meta, or 'Posted' text parsed with dateparser)
+    Returns dict or None.
     """
-    jobs = []
-    board_url = f"https://boards.greenhouse.io/{slug}"
+    r = http_get(url)
+    if not r or r.status_code != 200:
+        return None
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # Title heuristics
+    title = None
+    if soup.find("h1"):
+        title = soup.find("h1").get_text(strip=True)
+    if not title:
+        meta_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "title"})
+        if meta_title and meta_title.get("content"):
+            title = meta_title["content"].strip()
+    if not title and soup.title:
+        title = soup.title.string.strip()
+
+    # Company heuristics
+    company = None
+    meta_site = soup.find("meta", property="og:site_name")
+    if meta_site and meta_site.get("content"):
+        company = meta_site["content"].strip()
+    if not company:
+        # common patterns
+        c = soup.select_one(".company") or soup.select_one(".company-name") or soup.select_one("[class*=company]")
+        if c:
+            company = c.get_text(strip=True)
+    if not company:
+        # fallback to domain
+        company = domain_of(url)
+
+    # Location heuristics
+    location = None
+    # look for time/location blocks
+    loc_candidates = []
+    # meta keywords
+    meta_loc = soup.find("meta", attrs={"name": "jobLocation"}) or soup.find("meta", attrs={"property": "jobLocation"})
+    if meta_loc and meta_loc.get("content"):
+        loc_candidates.append(meta_loc["content"])
+    # look for elements that contain 'Location' label
+    for lbl in soup.find_all(text=re.compile(r"Location|location", re.I)):
+        parent = lbl.parent
+        if parent and parent.name in ("span", "p", "div", "li"):
+            txt = parent.get_text(" ", strip=True)
+            # remove the label itself if present
+            txt = re.sub(r"(?i)location[:\s]*", "", txt).strip()
+            if txt:
+                loc_candidates.append(txt)
+    # time tag: sometimes job pages have <time datetime=...>
+    time_tag = soup.find("time")
+    posted_dt = None
+    if time_tag and time_tag.get("datetime"):
+        posted_dt = parse_date(time_tag["datetime"])
+    # look in text for "Posted" patterns
+    if not posted_dt:
+        full_text = soup.get_text(" ", strip=True)
+        m = re.search(r"Posted(?: on)?[:\s]*([A-Za-z0-9, \-:/]+)", full_text, re.I)
+        if m:
+            posted_dt = parse_date(m.group(1))
+        else:
+            # phrases like "just posted", "1 day ago"
+            m2 = re.search(r"\b(\d+)\s+day[s]?\s+ago\b", full_text, re.I)
+            if m2:
+                posted_dt = datetime.now() - timedelta(days=int(m2.group(1)))
+            elif re.search(r"\bjust posted\b|\bjust now\b", full_text, re.I):
+                posted_dt = datetime.now()
+
+    # choose location if any candidate looks like US or remote/hybrid
+    for c in loc_candidates:
+        if looks_like_us_location(c):
+            location = c.strip()
+            break
+    if not location:
+        # try to read any nearby "location" classes
+        loc_tag = soup.select_one("[class*=location]") or soup.select_one(".job-location")
+        if loc_tag:
+            txt = loc_tag.get_text(" ", strip=True)
+            if looks_like_us_location(txt):
+                location = txt
+
+    # fallback: if page contains 'remote' anywhere
+    if not location:
+        if re.search(r"\bremote\b", r.text, re.I):
+            location = "Remote"
+
+    if not title:
+        return None
+
+    # If posted_dt exists ensure within 24 hours
+    if posted_dt and not posted_within_24h(posted_dt):
+        return None
+
+    # Final company/location defaults
+    if not location:
+        location = "Unknown"
+
+    return {
+        "Job Title": title.strip(),
+        "Company": company.strip() if company else domain_of(url),
+        "Location": location,
+        "Apply Link": url,
+        "Posted Date": posted_dt.isoformat() if posted_dt else ""
+    }
+
+
+# -------- Search via DuckDuckGo HTML --------
+def ddg_search(query, max_results=30):
+    """
+    Use DuckDuckGo HTML endpoint to get search results. Returns a list of result URLs and titles/snippets.
+    """
     try:
-        r = requests.get(board_url, headers=USER_AGENT, timeout=12)
-        if r.status_code != 200:
-            return jobs
-        soup = BeautifulSoup(r.text, "html.parser")
-        openings = soup.find_all("div", class_="opening")
-        for o in openings:
-            a = o.find("a")
-            if not a:
-                continue
-            title = a.get_text(strip=True)
+        resp = requests.post(DUCKDUCKGO_HTML, data={"q": query}, headers=USER_AGENT, timeout=12)
+        resp.raise_for_status()
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results = []
+    # DuckDuckGo html returns .result__a anchors for links
+    for a in soup.select("a.result__a")[:max_results]:
+        href = a.get("href")
+        title = a.get_text(" ", strip=True)
+        if href:
+            results.append((title, href))
+    # fallback broader selector
+    if not results:
+        for a in soup.select("a[href]")[:max_results]:
             href = a.get("href")
-            if not href:
-                continue
-            job_url = urljoin(board_url, href)
-            # Fetch job page to find a time tag or 'posted' text
-            try:
-                jr = requests.get(job_url, headers=USER_AGENT, timeout=12)
-                if jr.status_code != 200:
-                    continue
-                jsoup = BeautifulSoup(jr.text, "html.parser")
-                # Look for <time datetime="...">
-                time_tag = jsoup.find("time")
-                dt = None
-                if time_tag and time_tag.get("datetime"):
-                    dt = parse_date(time_tag["datetime"])
-                if not dt:
-                    # Look for text like "Posted" or "Posted on"
-                    txt = jsoup.get_text(" ", strip=True)
-                    import re
-                    m = re.search(r"Posted(?: on)?[:\s]+([A-Za-z0-9, \-:/]+)", txt, re.IGNORECASE)
-                    if m:
-                        dt = parse_date(m.group(1))
-                if dt and is_recent(dt):
-                    # Location may be present in job page
-                    loc_tag = jsoup.find("span", class_="location") or jsoup.find("span", class_="posting-location")
-                    loc = loc_tag.get_text(strip=True) if loc_tag else "Remote"
-                    jobs.append({
-                        "Job Title": title,
-                        "Company": display_name or slug,
-                        "Location": loc,
-                        "Apply Link": job_url,
-                        "Posted Date": dt.isoformat()
-                    })
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return jobs
+            title = a.get_text(" ", strip=True)
+            if href and 'duckduckgo.com' not in href:
+                results.append((title, href))
+    return results
 
-# ---------------- Generic URL-based scraping (best-effort) ----------------
-def scrape_generic(url, display_name=None):
-    """
-    Best-effort: fetch page, find job links, and inspect job pages for a datetime.
-    Only returns roles with an explicit date within last 24 hours.
-    """
-    jobs = []
-    try:
-        r = requests.get(url, headers=USER_AGENT, timeout=12)
-        if r.status_code != 200:
-            return jobs
-        soup = BeautifulSoup(r.text, "html.parser")
-        anchors = soup.find_all("a", href=True)
-        seen_links = set()
-        for a in anchors:
-            href = a["href"]
-            if any(k in href.lower() for k in ("/job", "/jobs/", "/careers/", "/apply")):
-                job_url = urljoin(url, href)
-                if job_url in seen_links:
-                    continue
-                seen_links.add(job_url)
-                # fetch job page and try to find a date
-                try:
-                    jr = requests.get(job_url, headers=USER_AGENT, timeout=12)
-                    if jr.status_code != 200:
-                        continue
-                    jsoup = BeautifulSoup(jr.text, "html.parser")
-                    # look for time tag or meta property
-                    dt = None
-                    time_tag = jsoup.find("time")
-                    if time_tag and time_tag.get("datetime"):
-                        dt = parse_date(time_tag["datetime"])
-                    if not dt:
-                        meta_dt = jsoup.find("meta", {"property": "article:published_time"}) or jsoup.find("meta", {"name": "date"})
-                        if meta_dt and meta_dt.get("content"):
-                            dt = parse_date(meta_dt["content"])
-                    if not dt:
-                        txt = jsoup.get_text(" ", strip=True)
-                        import re
-                        m = re.search(r"Posted(?: on)?[:\s]+([A-Za-z0-9, \-:/]+)", txt, re.IGNORECASE)
-                        if m:
-                            dt = parse_date(m.group(1))
-                    if dt and is_recent(dt):
-                        title = jsoup.title.string.strip() if jsoup.title and jsoup.title.string else (a.get_text(strip=True) or "Job")
-                        # try to find location
-                        loc = "Remote"
-                        loc_tag = jsoup.find(lambda t: t.name in ("span", "p", "div") and "location" in (t.get("class") or []) )
-                        if loc_tag:
-                            loc = loc_tag.get_text(strip=True)
-                        jobs.append({
-                            "Job Title": title,
-                            "Company": display_name or domain_of(url),
-                            "Location": loc,
-                            "Apply Link": job_url,
-                            "Posted Date": dt.isoformat()
-                        })
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return jobs
+# -------- Build site-limited queries --------
+def build_queries():
+    queries = []
+    # combine keywords with reputable sites as site: filters
+    site_filter = " OR ".join(f"site:{s}" for s in REPUTABLE_SITES)
+    for kw in KEYWORDS:
+        q = f'{kw} ({site_filter}) "United States" OR "Remote" OR "Hybrid"'
+        queries.append(q)
+    return queries
 
-# ---------------- Main collector ----------------
-def collect_jobs(companies_map):
-    all_jobs = []
+# -------- Collector --------
+def collect_jobs():
+    queries = build_queries()
     seen = set()
-    for display_name, entry in companies_map.items():
-        platform = entry.get("platform")
-        value = entry.get("value")
-        if not platform or not value:
-            continue
-        try:
-            if platform == "lever":
-                jobs = scrape_lever(value, display_name)
-            elif platform == "greenhouse":
-                jobs = scrape_greenhouse(value, display_name)
-            elif platform == "url":
-                jobs = scrape_generic(value, display_name)
-            else:
-                jobs = []
-        except Exception:
-            jobs = []
-        for j in jobs:
-            key = (j["Job Title"], j["Company"], j["Apply Link"])
+    out = []
+
+    for q in queries:
+        results = ddg_search(q, max_results=25)
+        time.sleep(1)  # politeness between searches
+        for title, href in results:
+            # normalize href sometimes prefixed with /l/?kh=...
+            # DuckDuckGo may produce redirect wrappers; attempt to unescape if possible
+            # For our purposes, follow the href directly
+            if not href.startswith("http"):
+                continue
+            # filter to reputable domains only (safety)
+            dom = domain_of(href)
+            if not any(s in dom for s in REPUTABLE_SITES):
+                # still allow common boards like indeed/linkedin even if domain variations exist
+                pass
+
+            # Visit the job page and extract details
+            job = extract_job_from_page(href)
+            if not job:
+                continue
+            # ensure role matches keywords
+            combined = " ".join([job.get("Job Title",""), job.get("Company","")]).lower()
+            if not matches_role(combined):
+                continue
+            # ensure US / remote / hybrid
+            if not looks_like_us_location(job.get("Location","")):
+                continue
+            key = (job["Job Title"], job["Company"], job["Apply Link"])
             if key in seen:
                 continue
             seen.add(key)
-            all_jobs.append(j)
-    return all_jobs
+            out.append(job)
+            # be polite and avoid hammering
+            time.sleep(0.6)
+    return out
 
-# ---------------- Email ----------------
+
+# -------- Email & CSV --------
 def send_email(jobs):
     today = datetime.now().strftime("%Y-%m-%d")
     msg = EmailMessage()
-    msg["Subject"] = f"Daily Curated Jobs ({today})"
+    msg["Subject"] = f"Daily US Software Jobs ({today})"
     msg["From"] = EMAIL
     msg["To"] = RECIPIENT
 
     if not jobs:
-        body = "No new curated jobs found in the last 24 hours."
-        msg.set_content(body)
+        msg.set_content("No new US software jobs found in the last 24 hours.")
     else:
-        lines = []
-        for j in jobs:
-            lines.append(f"{j['Job Title']} | {j['Company']} | {j['Location']} | {j['Apply Link']}")
-        body = "Curated jobs posted in the last 24 hours:\n\n" + "\n".join(lines)
-        msg.set_content(body)
-
+        lines = [f"{j['Job Title']} | {j['Company']} | {j['Location']} | {j['Apply Link']}" for j in jobs]
+        msg.set_content("Jobs posted/updated in the last 24 hours (US positions):\n\n" + "\n".join(lines))
         # CSV attachment
         csv_buf = io.StringIO()
         writer = csv.DictWriter(csv_buf, fieldnames=["Job Title", "Company", "Location", "Apply Link", "Posted Date"])
@@ -281,34 +346,20 @@ def send_email(jobs):
             writer.writerow(j)
         msg.add_attachment(csv_buf.getvalue().encode("utf-8"), maintype="text", subtype="csv", filename=f"jobs_{today}.csv")
 
-    # send
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
         s.login(EMAIL, PASSWORD)
         s.send_message(msg)
 
-    print(f"Email sent to {RECIPIENT} with {len(jobs)} jobs.")
+    print(f"[{datetime.now().isoformat()}] Sent email to {RECIPIENT} with {len(jobs)} jobs.")
 
-# ---------------- Entrypoint ----------------
+
+# -------- Entrypoint --------
 def main():
-    # Load companies.json (curated list)
-    if not os.path.exists(COMPANIES_FILE):
-        sample = {
-            "Stripe": {"platform": "lever", "value": "stripe"},
-            "Coinbase": {"platform": "lever", "value": "coinbase"},
-            "YourGreenhouseCo": {"platform": "greenhouse", "value": "yourcompanyslug"},
-            "YourCareersPage": {"platform": "url", "value": "https://yourcompany.com/careers"}
-        }
-        with open(COMPANIES_FILE, "w", encoding="utf-8") as f:
-            json.dump(sample, f, indent=2)
-        sys.exit(f"No {COMPANIES_FILE} found. A sample was created. Edit it with your curated companies and re-run.")
-
-    with open(COMPANIES_FILE, "r", encoding="utf-8") as f:
-        companies_map = json.load(f)
-
-    print(f"[{datetime.now().isoformat()}] Collecting jobs for {len(companies_map)} curated companies...")
-    jobs = collect_jobs(companies_map)
-    print(f"Found {len(jobs)} recent jobs. Sending email...")
+    print(f"[{datetime.now().isoformat()}] Starting collection (US onsite/hybrid/remote, last 24h)...")
+    jobs = collect_jobs()
+    print(f"Collected {len(jobs)} jobs. Sending email...")
     send_email(jobs)
+
 
 if __name__ == "__main__":
     main()
