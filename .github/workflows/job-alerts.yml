@@ -1,0 +1,26 @@
+name: Daily Job Alerts
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+jobs:
+  run-job-search:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run job search
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python job_search.py
