@@ -2,19 +2,15 @@
 """
 job_alerts.py
 
-Robust, best-effort collector for U.S. software engineering roles (onsite / hybrid / remote)
-posted/updated within the last N days (default 1). It tries multiple reputable sources,
-parses job pages for exact title/company/location/apply link, deduplicates results and
-emails a CSV + plain-text summary.
+One-shot job collector that:
+- Does NOT filter by post date (includes older postings).
+- Only includes positions that indicate a US location (onsite/hybrid). Remote is included
+  only when the posting explicitly indicates US-based / United States / USA.
+- Applies strict role matching by default (loose mode optional via LOOSE=1 env).
+- Searches multiple reputable job boards and uses site-limited web search (DuckDuckGo HTML).
+- Deduplicates results and emails a CSV + plain-text summary.
 
-Important limitations (honest):
-- Scraping public job boards is inherently brittle: some sites use JS, rate-limit, or block
-  non-browser clients. This script is "best-effort" and cannot be guaranteed 100% reliable.
-- For production-grade, consider official APIs or a paid job-data provider.
-- This script is defensive: retries, timeouts, conservative date parsing, and always exits 0
-  (sends an email even when nothing is found or an error occurred).
-
-Environment variables (required):
+Environment variables required:
 - EMAIL_ADDRESS
 - EMAIL_PASSWORD
 
@@ -22,17 +18,13 @@ Optional:
 - RECIPIENT (defaults to EMAIL_ADDRESS)
 - SMTP_HOST (default: smtp.gmail.com)
 - SMTP_PORT (default: 465)
-- DAYS (integer days window; default: 1)
-- DEBUG (set to "1" to relax some checks and get more verbose logs)
+- LOOSE (set to "1" to allow a looser keyword match)
 - MAX_RESULTS_PER_QUERY (default: 30)
+- DEBUG (set to "1" for verbose logs)
 
-Dependencies:
-pip install requests beautifulsoup4 python-dateutil dateparser
-
-Usage:
-- Use as a one-shot (GitHub Actions cron should run it). Do NOT run a long-lived scheduler here.
-- Example (local):
-  EMAIL_ADDRESS=you@host.com EMAIL_PASSWORD=app_password DEBUG=1 python job_alerts.py
+Notes:
+- Scraping is best-effort; some sites (LinkedIn/Glassdoor) may block or require JS.
+- This script is safe to run in GitHub Actions (one-shot). It exits 0 even if no results.
 """
 
 from datetime import datetime, timedelta
@@ -46,72 +38,67 @@ import re
 import requests
 from urllib.parse import urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
-import dateparser
 from email.message import EmailMessage
 import smtplib
+import dateparser
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ---------------- Config ----------------
+# ---------------- Config & Logging ----------------
 EMAIL = os.environ.get("EMAIL_ADDRESS")
 PASSWORD = os.environ.get("EMAIL_PASSWORD")
-RECIPIENT = os.environ.get("RECIPIENT", EMAIL)
+RECIPIENT = os.environ.get("EMAIL_ADDRESS", EMAIL)
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", 465))
-DAYS = int(os.environ.get("DAYS", "1"))
+LOOSE = os.environ.get("LOOSE", "") == "1"
 DEBUG = os.environ.get("DEBUG", "") == "1"
 MAX_RESULTS_PER_QUERY = int(os.environ.get("MAX_RESULTS_PER_QUERY", "30"))
 
 if not EMAIL or not PASSWORD:
-    print("ERROR: EMAIL_ADDRESS and EMAIL_PASSWORD must be set in environment.", file=sys.stderr)
-    # Do not raise; exit gracefully after sending failure email will not be possible.
+    print("Missing EMAIL_ADDRESS or EMAIL_PASSWORD in environment. Exiting.")
     sys.exit(0)
 
-TIME_WINDOW = timedelta(days=DAYS)
+log_level = logging.DEBUG if DEBUG else logging.INFO
+logging.basicConfig(level=log_level, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("job_alerts")
 
-# Reputable sites (we'll bias searches to these domains)
-REPUTABLE_SITES = [
-    "remoteok.com", "weworkremotely.com", "remote.co",
-    "indeed.com", "linkedin.com", "workday.com",
-    "lever.co", "greenhouse.io", "angel.co", "wellfound.com", "glassdoor.com"
-]
+# ---------------- Globals ----------------
+USER_AGENT = {"User-Agent": "Mozilla/5.0 (compatible; JobAlerts/1.0)"}
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504))
+session.mount("https://", HTTPAdapter(max_retries=retries))
+session.headers.update(USER_AGENT)
 
-# DuckDuckGo HTML endpoint (less aggressive blocking)
 DUCKDUCKGO_HTML = "https://html.duckduckgo.com/html/"
 
-# Keywords for role matching
-KEYWORDS = [
+REPUTABLE_SITES = [
+    "lever.co", "greenhouse.io", "workday.com", "indeed.com", "linkedin.com",
+    "angel.co", "glassdoor.com", "remoteok.com", "weworkremotely.com", "remote.co", "wellfound.com"
+]
+
+KEYWORDS_STRICT = [
     "software engineer", "software developer", "full stack", "full-stack",
     "backend engineer", "frontend engineer", "backend developer", "frontend developer",
     "swe", "software eng"
+]
+KEYWORDS_LOOSE = [
+    "engineer", "developer", "software", "fullstack", "full-stack", "swe"
 ]
 
 US_STATE_ABBRS = set("""
 AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT
 NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY
 """.split())
-US_INDICATORS = ["united states", "usa", "us", "u.s.", "u.s.a."]
-
-# ---------------- Logging ----------------
-log_level = logging.DEBUG if DEBUG else logging.INFO
-logging.basicConfig(level=log_level, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("job_alerts")
-
-# ---------------- HTTP session with retries ----------------
-session = requests.Session()
-retries = Retry(total=3, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504))
-session.mount("https://", HTTPAdapter(max_retries=retries))
-session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; JobAlerts/1.0)"})
-
-def safe_get(url, timeout=12):
-    try:
-        r = session.get(url, timeout=timeout)
-        return r
-    except Exception as e:
-        logger.debug("safe_get error for %s: %s", url, e)
-        return None
+US_INDICATORS = ["united states", "usa", "us", "u.s.", "u.s.a.", "united states of america", "america"]
 
 # ---------------- Helpers ----------------
+def safe_get(url, timeout=12):
+    try:
+        return session.get(url, timeout=timeout)
+    except Exception as e:
+        logger.debug("HTTP GET failed for %s : %s", url, e)
+        return None
+
 def domain_of(url):
     try:
         return urlparse(url).netloc.lower().replace("www.", "")
@@ -126,285 +113,113 @@ def parse_date(text):
     except Exception:
         return None
 
-def within_window(dt):
-    if not dt:
-        return False
-    return (datetime.now() - dt) <= TIME_WINDOW
-
-def looks_like_us_location(text):
-    if not text:
-        return False
-    t = text.lower()
-    if any(ind in t for ind in US_INDICATORS):
-        return True
-    if "remote" in t:
-        return True
-    if "hybrid" in t:
-        return True
-    # City, ST
-    m = re.search(r",\s*([A-Za-z]{2})\b", text)
-    if m and m.group(1).upper() in US_STATE_ABBRS:
-        return True
-    # full state names quick check
-    for s in ["california","new york","texas","washington","florida","illinois","massachusetts"]:
-        if s in t:
-            return True
-    return False
-
 def matches_role(text):
     if not text:
         return False
     t = text.lower()
-    return any(k in t for k in KEYWORDS)
+    keywords = KEYWORDS_LOOSE if LOOSE else KEYWORDS_STRICT
+    for kw in keywords:
+        if kw in t:
+            return True
+    return False
 
-def try_extract_posted_from_text(text):
+def looks_like_us_location(text):
+    """
+    Return True if text indicates a US location or explicit 'US-based' mention.
+    Remote is accepted only if explicitly US-based.
+    """
     if not text:
-        return None
-    # patterns: 'Posted X hours ago', 'Posted on MMM DD, YYYY', 'X days ago'
-    m = re.search(r"(\d+)\s+hour[s]?\s+ago", text, re.I)
-    if m:
-        return datetime.now() - timedelta(hours=int(m.group(1)))
-    m = re.search(r"(\d+)\s+day[s]?\s+ago", text, re.I)
-    if m:
-        return datetime.now() - timedelta(days=int(m.group(1)))
-    m = re.search(r"Posted on[:\s]*([A-Za-z0-9, \-:/]+)", text, re.I)
-    if m:
-        return parse_date(m.group(1))
-    m = re.search(r"Posted[:\s]*([A-Za-z0-9, \-:/]+)", text, re.I)
-    if m:
-        return parse_date(m.group(1))
-    if re.search(r"just posted|just now", text, re.I):
-        return datetime.now()
-    return None
+        return False
+    t = text.lower()
+    # explicit US mentions
+    if any(ind in t for ind in US_INDICATORS):
+        return True
+    # explicit US-based remote
+    if "us-based" in t or "us based" in t or "u.s.-based" in t or "u.s. based" in t:
+        return True
+    # remote without US mention -> reject (we want US positions)
+    if "remote" in t and not any(ind in t for ind in US_INDICATORS):
+        return False
+    # hybrid / onsite indicators
+    if "hybrid" in t or "on-site" in t or "onsite" in t or "office" in t:
+        # accept if a state abbreviation or full state name present nearby
+        # look for "City, ST" patterns
+        m = re.search(r",\s*([A-Za-z]{2})\b", text)
+        if m and m.group(1).upper() in US_STATE_ABBRS:
+            return True
+        # check common full state names
+        for st in ("california","new york","texas","washington","florida","illinois","massachusetts"):
+            if st in t:
+                return True
+        # check if contains country name
+        if any(ind in t for ind in US_INDICATORS):
+            return True
+    # City, ST patterns anywhere
+    m = re.search(r",\s*([A-Za-z]{2})\b", text)
+    if m and m.group(1).upper() in US_STATE_ABBRS:
+        return True
+    # fallback: contains common US city names (limited)
+    for city in ("san francisco", "new york", "seattle", "austin", "chicago", "boston", "los angeles"):
+        if city in t:
+            return True
+    return False
 
-# ---------------- Source: RemoteOK (JSON, reliable) ----------------
-def fetch_remoteok():
-    logger.info("Fetching RemoteOK...")
-    out = []
-    try:
-        resp = safe_get("https://remoteok.com/api")
-        if not resp or resp.status_code != 200:
-            logger.debug("RemoteOK API request failed or non-200.")
-            return out
-        data = resp.json()
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            # RemoteOK returns a "date" or "date_posted"
-            try:
-                company = item.get("company") or item.get("slug") or ""
-                title = item.get("position") or item.get("title") or item.get("position_name") or ""
-                link = item.get("url") or item.get("apply_url") or item.get("link") or ""
-                if link and link.startswith("/"):
-                    link = urljoin("https://remoteok.com", link)
-                date_str = item.get("date") or item.get("created_at") or item.get("time")
-                posted = parse_date(str(date_str)) if date_str else None
-                if not title or not company or not link:
-                    continue
-                if posted and not within_window(posted):
-                    continue
-                # allow if posted missing but description/tag indicates "just posted"
-                combined = " ".join([title, company, " ".join(item.get("tags", []) if isinstance(item.get("tags", []), list) else [])])
-                if not matches_role(combined):
-                    continue
-                # accept; best-effort location
-                location = item.get("location") or "Remote"
-                out.append({
-                    "Job Title": title.strip(),
-                    "Company": company.strip(),
-                    "Location": location,
-                    "Apply Link": link,
-                    "Posted Date": posted.isoformat() if posted else ""
-                })
-            except Exception:
-                continue
-    except Exception as e:
-        logger.debug("fetch_remoteok error: %s", e)
-    logger.info("RemoteOK found %d items", len(out))
-    return out
-
-# ---------------- Source: WeWorkRemotely (HTML) ----------------
-def fetch_weworkremotely():
-    logger.info("Fetching WeWorkRemotely...")
-    out = []
-    base = "https://weworkremotely.com"
-    cat = f"{base}/categories/remote-programming-jobs"
-    try:
-        r = safe_get(cat)
-        if not r or r.status_code != 200:
-            return out
-        soup = BeautifulSoup(r.text, "html.parser")
-        # anchors to job pages are under sections with 'jobs'
-        anchors = soup.select("section.jobs a") or soup.select("a[href*='/remote-jobs/']")
-        links = []
-        for a in anchors:
-            href = a.get("href")
-            if not href:
-                continue
-            # avoid mixed external links
-            if href.startswith("/"):
-                job_url = urljoin(base, href)
-            else:
-                job_url = href
-            links.append(job_url)
-        links = sorted(set(links))
-        for job_url in links[:150]:
-            try:
-                jr = safe_get(job_url)
-                if not jr or jr.status_code != 200:
-                    continue
-                jsoup = BeautifulSoup(jr.text, "html.parser")
-                title = (jsoup.find("h1").get_text(strip=True) if jsoup.find("h1") else "") or ""
-                company_tag = jsoup.select_one(".company") or jsoup.select_one(".company-card h2") or jsoup.select_one(".company-name")
-                company = company_tag.get_text(strip=True) if company_tag else domain_of(job_url)
-                # posted date
-                dt = None
-                time_tag = jsoup.find("time")
-                if time_tag and time_tag.get("datetime"):
-                    dt = parse_date(time_tag["datetime"])
-                if not dt:
-                    dt = try_extract_posted_from_text(jsoup.get_text(" ", strip=True))
-                if dt and not within_window(dt):
-                    continue
-                if not matches_role(title):
-                    continue
-                # location detection
-                loc = "Remote"
-                # check text nearby for 'Location' label
-                for txt in jsoup.stripped_strings:
-                    if "location" in txt.lower() and "," in txt:
-                        # naive attempt
-                        if looks_like_us_location(txt):
-                            loc = txt
-                            break
-                out.append({
-                    "Job Title": title,
-                    "Company": company,
-                    "Location": loc,
-                    "Apply Link": job_url,
-                    "Posted Date": dt.isoformat() if dt else ""
-                })
-                time.sleep(0.3)
-            except Exception:
-                continue
-    except Exception as e:
-        logger.debug("fetch_weworkremotely error: %s", e)
-    logger.info("WeWorkRemotely found %d items", len(out))
-    return out
-
-# ---------------- Source: Remote.co (HTML) ----------------
-def fetch_remote_co():
-    logger.info("Fetching Remote.co...")
-    out = []
-    base = "https://remote.co"
-    list_url = f"{base}/remote-jobs/developer/"
-    try:
-        r = safe_get(list_url)
-        if not r or r.status_code != 200:
-            return out
-        soup = BeautifulSoup(r.text, "html.parser")
-        # links are in .job_listing or a.job-listing
-        cards = soup.select("a.job-listing") + soup.select("article.job_listing a")
-        job_links = []
-        for a in cards:
-            href = a.get("href")
-            if not href:
-                continue
-            job_links.append(urljoin(base, href))
-        for job_url in sorted(set(job_links))[:120]:
-            try:
-                jr = safe_get(job_url)
-                if not jr or jr.status_code != 200:
-                    continue
-                jsoup = BeautifulSoup(jr.text, "html.parser")
-                title = jsoup.find("h1").get_text(strip=True) if jsoup.find("h1") else jsoup.title.string if jsoup.title else ""
-                company = ""
-                # remote.co sometimes has company in .company or h2/h3
-                ctag = jsoup.find(lambda t: t.name in ("h2","h3") and "company" in (t.get("class") or []))
-                if ctag:
-                    company = ctag.get_text(strip=True)
-                dt = None
-                time_tag = jsoup.find("time")
-                if time_tag and time_tag.get("datetime"):
-                    dt = parse_date(time_tag["datetime"])
-                if not dt:
-                    dt = try_extract_posted_from_text(jsoup.get_text(" ", strip=True))
-                if dt and not within_window(dt):
-                    continue
-                if not matches_role(title):
-                    continue
-                loc = "Remote"
-                out.append({
-                    "Job Title": title,
-                    "Company": company or domain_of(job_url),
-                    "Location": loc,
-                    "Apply Link": job_url,
-                    "Posted Date": dt.isoformat() if dt else ""
-                })
-                time.sleep(0.3)
-            except Exception:
-                continue
-    except Exception as e:
-        logger.debug("fetch_remote_co error: %s", e)
-    logger.info("Remote.co found %d items", len(out))
-    return out
-
-# ---------------- Search via DuckDuckGo (site-limited) ----------------
+# ---------------- Search (DuckDuckGo HTML) ----------------
 def ddg_search(query, max_results=MAX_RESULTS_PER_QUERY):
-    logger.debug("DDG search query: %s", query)
+    logger.debug("DDG query: %s", query)
     try:
         resp = session.post(DUCKDUCKGO_HTML, data={"q": query}, timeout=12)
         resp.raise_for_status()
     except Exception as e:
-        logger.debug("ddg_search request error: %s", e)
+        logger.debug("DDG request failed: %s", e)
         return []
     soup = BeautifulSoup(resp.text, "html.parser")
     results = []
-    # primary selector
     for a in soup.select("a.result__a")[:max_results]:
         href = a.get("href")
         title = a.get_text(" ", strip=True)
-        if href and not href.startswith("javascript:"):
-            # unescape ddg wrapper sometimes
+        if href and href.startswith("http"):
             href = unquote(href)
             results.append((title, href))
     if not results:
-        # fallback
+        # fallback selector
         for a in soup.select("a[href]")[:max_results]:
             href = a.get("href")
             title = a.get_text(" ", strip=True)
-            if href and 'duckduckgo.com' not in href:
+            if href and href.startswith("http") and 'duckduckgo.com' not in href:
                 results.append((title, href))
-    logger.debug("DDG search returned %d results", len(results))
+    logger.debug("DDG returned %d results", len(results))
     return results
 
 def build_queries():
     site_filter = " OR ".join(f"site:{s}" for s in REPUTABLE_SITES)
     queries = []
-    for kw in KEYWORDS:
-        q = f'{kw} ({site_filter}) "United States" OR "Remote" OR "Hybrid"'
+    keywords = KEYWORDS_LOOSE if LOOSE else KEYWORDS_STRICT
+    for kw in keywords:
+        q = f'{kw} ({site_filter}) "United States" OR "US" OR "USA"'
         queries.append(q)
     return queries
 
-# ---------------- Page extractor (generic) ----------------
+# ---------------- Generic page extraction ----------------
 def extract_job_from_page(url):
     r = safe_get(url)
     if not r or r.status_code != 200:
         return None
     soup = BeautifulSoup(r.text, "html.parser")
-    # Title
+    # Title heuristics
     title = None
-    if soup.find("h1"):
-        title = soup.find("h1").get_text(strip=True)
+    h1 = soup.find("h1")
+    if h1:
+        title = h1.get_text(strip=True)
     if not title:
-        meta_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name":"title"})
+        meta_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "title"})
         if meta_title and meta_title.get("content"):
             title = meta_title["content"].strip()
     if not title and soup.title:
         title = soup.title.string.strip()
     if not title:
         return None
-    # Company
+    # Company heuristics
     company = None
     meta_site = soup.find("meta", property="og:site_name")
     if meta_site and meta_site.get("content"):
@@ -415,161 +230,245 @@ def extract_job_from_page(url):
             company = ctag.get_text(strip=True)
     if not company:
         company = domain_of(url)
-    # Location
+    # Location heuristics: meta, labels, body patterns
     location = None
-    # try structured meta
     meta_loc = soup.find("meta", attrs={"name": "jobLocation"}) or soup.find("meta", attrs={"property":"jobLocation"})
     if meta_loc and meta_loc.get("content"):
         location = meta_loc["content"].strip()
     if not location:
-        # search for nearby 'Location' label
-        for elem in soup.find_all(text=re.compile(r"Location", re.I)):
-            parent = elem.parent
+        # look for 'Location' label text
+        for txt in soup.find_all(text=re.compile(r"Location", re.I)):
+            parent = txt.parent
             if parent:
-                txt = parent.get_text(" ", strip=True)
-                txt = re.sub(r"(?i)location[:\s]*", "", txt).strip()
-                if txt:
-                    location = txt
+                nearby = parent.get_text(" ", strip=True)
+                nearby = re.sub(r"(?i)location[:\s]*", "", nearby).strip()
+                if nearby:
+                    location = nearby
                     break
     if not location:
-        # fallback search in body for city/state patterns
         body = soup.get_text(" ", strip=True)
+        # City, ST
         m = re.search(r"\b[A-Za-z .'-]+,\s*([A-Za-z]{2})\b", body)
         if m:
-            # capture a small context
+            # capture fragment for clarity
             start = max(0, m.start()-40)
             location = body[start:m.end()+40].split("\n")[0].strip()
     if not location and re.search(r"\bremote\b", r.text, re.I):
         location = "Remote"
     if not location:
         location = "Unknown"
-    # Posted date
-    posted = None
-    time_tag = soup.find("time")
-    if time_tag and time_tag.get("datetime"):
-        posted = parse_date(time_tag["datetime"])
-    if not posted:
-        # meta published
-        meta_p = soup.find("meta", {"property":"article:published_time"}) or soup.find("meta", {"name":"date"})
-        if meta_p and meta_p.get("content"):
-            posted = parse_date(meta_p["content"])
-    if not posted:
-        posted = try_extract_posted_from_text(soup.get_text(" ", strip=True))
-    # If posted exists and is outside window, skip
-    if posted and not within_window(posted):
+    # Apply link: use canonical link or page url
+    apply_link = url
+    canonical = soup.find("link", rel="canonical")
+    if canonical and canonical.get("href"):
+        apply_link = canonical["href"]
+    # No date filtering per request (we include older postings)
+    # Role matching
+    combined = " ".join([title, company]).lower()
+    if not matches_role(combined):
         return None
-    # ensure role matches
-    if not matches_role(title + " " + company):
-        return None
-    # ensure US location or remote/hybrid
+    # Location must be US (or Remote with explicit US mention)
     if not looks_like_us_location(location):
-        return None
+        # attempt to check body for US indicators (maybe location parsing missed)
+        if not looks_like_us_location(soup.get_text(" ", strip=True)):
+            return None
     return {
         "Job Title": title.strip(),
         "Company": company.strip(),
         "Location": location.strip(),
-        "Apply Link": url,
-        "Posted Date": posted.isoformat() if posted else ""
+        "Apply Link": apply_link,
+        "Source URL": url,
+        "Scraped At": datetime.now().isoformat()
     }
 
+# ---------------- Source-specific fetchers (best-effort) ----------------
+def fetch_remoteok():
+    logger.info("Fetching RemoteOK API...")
+    out = []
+    try:
+        r = safe_get("https://remoteok.com/api")
+        if not r or r.status_code != 200:
+            return out
+        data = r.json()
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("position") or item.get("title") or ""
+            company = item.get("company") or ""
+            link = item.get("url") or item.get("apply_url") or ""
+            if link and link.startswith("/"):
+                link = urljoin("https://remoteok.com", link)
+            combined = " ".join([title, company, " ".join(item.get("tags", []) if isinstance(item.get("tags", []), list) else [])])
+            if not matches_role(combined):
+                continue
+            # RemoteOK location can be varied; include only if US or US-based present
+            loc = item.get("location") or item.get("tags") or ""
+            loc_text = loc if isinstance(loc, str) else " ".join(loc) if isinstance(loc, list) else ""
+            if not looks_like_us_location(str(loc_text)):
+                # check description for US mention
+                if not looks_like_us_location(item.get("description", "") or item.get("notes", "") or ""):
+                    continue
+            out.append({
+                "Job Title": title.strip(),
+                "Company": company.strip() or domain_of(link),
+                "Location": loc_text or "Unknown",
+                "Apply Link": link or item.get("link") or "",
+                "Source URL": link or "",
+                "Scraped At": datetime.now().isoformat()
+            })
+    except Exception as e:
+        logger.debug("RemoteOK fetch error: %s", e)
+    logger.info("RemoteOK items: %d", len(out))
+    return out
+
+def fetch_weworkremotely():
+    logger.info("Fetching WeWorkRemotely...")
+    out = []
+    base = "https://weworkremotely.com"
+    cat = f"{base}/categories/remote-programming-jobs"
+    try:
+        r = safe_get(cat)
+        if not r or r.status_code != 200:
+            return out
+        soup = BeautifulSoup(r.text, "html.parser")
+        anchors = soup.select("section.jobs a") or soup.select("a[href*='/remote-jobs/']")
+        links = []
+        for a in anchors:
+            href = a.get("href")
+            if not href:
+                continue
+            job_url = urljoin(base, href) if href.startswith("/") else href
+            links.append(job_url)
+        for job_url in sorted(set(links))[:150]:
+            try:
+                # extract generically (no date filter)
+                job = extract_job_from_page(job_url)
+                if job:
+                    out.append(job)
+                time.sleep(0.25)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug("WeWorkRemotely error: %s", e)
+    logger.info("WeWorkRemotely items: %d", len(out))
+    return out
+
+def fetch_remote_co():
+    logger.info("Fetching Remote.co...")
+    out = []
+    base = "https://remote.co"
+    list_url = f"{base}/remote-jobs/developer/"
+    try:
+        r = safe_get(list_url)
+        if not r or r.status_code != 200:
+            return out
+        soup = BeautifulSoup(r.text, "html.parser")
+        cards = soup.select("a.job-listing") + soup.select("article.job_listing a")
+        links = []
+        for a in cards:
+            href = a.get("href")
+            if href:
+                links.append(urljoin(base, href))
+        for job_url in sorted(set(links))[:120]:
+            try:
+                job = extract_job_from_page(job_url)
+                if job:
+                    out.append(job)
+                time.sleep(0.25)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug("Remote.co error: %s", e)
+    logger.info("Remote.co items: %d", len(out))
+    return out
+
 # ---------------- Collector ----------------
-def collect_all():
+def collect_jobs():
     results = []
     seen = set()
-
-    # first fetch reliable APIs / sources
-    fetchers = [fetch_remoteok, fetch_weworkremotely, fetch_remote_co]
-    for f in fetchers:
+    # 1) Source-specific endpoints
+    for fetcher in (fetch_remoteok, fetch_weworkremotely, fetch_remote_co):
         try:
-            items = f()
-            for j in items:
-                key = (j["Job Title"], j["Company"], j["Apply Link"])
+            items = fetcher()
+            for it in items:
+                key = (it.get("Job Title"), it.get("Company"), it.get("Apply Link") or it.get("Source URL"))
                 if key in seen:
                     continue
                 seen.add(key)
-                results.append(j)
+                results.append(it)
         except Exception as e:
-            logger.debug("Fetcher %s failed: %s", f.__name__, e)
-
-    # then perform site-limited searches via DuckDuckGo for broader boards (indeed, workday, linkedin)
+            logger.debug("Fetcher %s failed: %s", fetcher.__name__, e)
+    # 2) DuckDuckGo site-limited searches for broader coverage (Indeed/LinkedIn/Workday/Lever/Greenhouse)
     queries = build_queries()
     for q in queries:
         try:
-            items = ddg_search(q)
-            time.sleep(0.8)
-            for title, href in items[:MAX_RESULTS_PER_QUERY]:
-                # normalize ddg redirect wrappers: many are direct links already
+            items = ddg_search(q, MAX_RESULTS_PER_QUERY)
+            time.sleep(0.6)
+            for title, href in items:
                 if not href.startswith("http"):
                     continue
-                # avoid repeat
-                if domain_of(href) == "duckduckgo.com":
-                    continue
-                # visit the page and extract job info
+                # prefer reputable domains but allow others
                 job = extract_job_from_page(href)
                 if not job:
                     continue
-                key = (job["Job Title"], job["Company"], job["Apply Link"])
+                key = (job.get("Job Title"), job.get("Company"), job.get("Apply Link") or job.get("Source URL"))
                 if key in seen:
                     continue
                 seen.add(key)
                 results.append(job)
-                time.sleep(0.5)
+                time.sleep(0.3)
         except Exception as e:
             logger.debug("Search query failed: %s", e)
-
-    logger.info("Total collected jobs: %d", len(results))
+    logger.info("Total jobs collected: %d", len(results))
     return results
 
 # ---------------- Email ----------------
-def send_email(jobs, success=True, error_message=None):
+def send_email(jobs):
     today = datetime.now().strftime("%Y-%m-%d")
-    subject = f"Daily US Software Jobs ({today})"
-    if not success:
-        subject = f"[ERROR] {subject}"
     msg = EmailMessage()
-    msg["Subject"] = subject
+    msg["Subject"] = f"US Software Jobs (relaxed date filter) - {today}"
     msg["From"] = EMAIL
     msg["To"] = RECIPIENT
 
     if not jobs:
-        body = "No new US software jobs found in the last {} day(s).".format(DAYS)
-        if error_message:
-            body += "\n\nError: " + error_message
-        msg.set_content(body)
+        msg.set_content("No jobs found matching the US-location + role constraints.")
     else:
-        lines = [f"{j['Job Title']} | {j['Company']} | {j['Location']} | {j['Apply Link']}" for j in jobs]
-        body = "Jobs posted/updated in the last {} day(s):\n\n".format(DAYS) + "\n".join(lines)
-        msg.set_content(body)
-        # attach CSV
+        lines = []
+        for j in jobs:
+            lines.append(f"{j.get('Job Title')} | {j.get('Company')} | {j.get('Location')} | {j.get('Apply Link') or j.get('Source URL')}")
+        msg.set_content("Jobs (no post-date filtering) matching role + US location:\n\n" + "\n".join(lines))
+        # CSV attach
         csv_buf = io.StringIO()
-        writer = csv.DictWriter(csv_buf, fieldnames=["Job Title", "Company", "Location", "Apply Link", "Posted Date"])
+        writer = csv.DictWriter(csv_buf, fieldnames=["Job Title", "Company", "Location", "Apply Link", "Source URL", "Scraped At"])
         writer.writeheader()
         for j in jobs:
-            writer.writerow(j)
+            writer.writerow({
+                "Job Title": j.get("Job Title",""),
+                "Company": j.get("Company",""),
+                "Location": j.get("Location",""),
+                "Apply Link": j.get("Apply Link",""),
+                "Source URL": j.get("Source URL",""),
+                "Scraped At": j.get("Scraped At","")
+            })
         msg.add_attachment(csv_buf.getvalue().encode("utf-8"), maintype="text", subtype="csv", filename=f"jobs_{today}.csv")
 
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
             s.login(EMAIL, PASSWORD)
             s.send_message(msg)
-        logger.info("Email sent to %s with %d jobs (success=%s).", RECIPIENT, len(jobs), success)
+        logger.info("Email sent to %s with %d jobs", RECIPIENT, len(jobs))
     except Exception as e:
         logger.error("Failed to send email: %s", e)
 
-# ---------------- Main ----------------
+# ---------------- Entrypoint ----------------
 def main():
-    start = datetime.now()
+    logger.info("Starting collection (no date filter, US locations only). LOOSE=%s DEBUG=%s", LOOSE, DEBUG)
     try:
-        jobs = collect_all()
-        send_email(jobs, success=True)
+        jobs = collect_jobs()
+        send_email(jobs)
     except Exception as e:
-        logger.exception("Unhandled error during collection")
-        # Always attempt to send an error email; since credentials exist we try
-        send_email([], success=False, error_message=str(e))
-    finally:
-        elapsed = (datetime.now() - start).total_seconds()
-        logger.info("Finished run in %.1f seconds", elapsed)
-    # Exit with code 0 to avoid workflow failures (you requested "no issues").
+        logger.exception("Unhandled error during run: %s", e)
+    logger.info("Run complete.")
     return 0
 
 if __name__ == "__main__":
